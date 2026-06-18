@@ -13,6 +13,14 @@ import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from xgboost import XGBClassifier
 
+import shap
+
+@st.cache_resource
+def load_explainer(_model):
+    return shap.TreeExplainer(_model)
+
+
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Fraud Detection System",
@@ -144,7 +152,9 @@ def load_artifacts():
     return model, ohe
 
 model, ohe = load_artifacts()
-
+explainer = load_explainer(model) if model is not None else None
+st.sidebar.write("Model loaded:", model is not None)
+st.sidebar.write("OHE loaded:", ohe is not None)
 # Exact feature order the model was trained on
 MODEL_FEATURES = [
     'amt', 'time_of_day', 'day_of_week', 'day_of_month', 'month', 'age',
@@ -258,11 +268,15 @@ def predict(features):
     return float(model.predict_proba(X)[0][1])
 
 
-def score_to_state(score):
-    if score >= THRESHOLD:
+def score_to_state(score , amt):
+    # 99th percentile of legitimate transactions
+    # fraud 75th percentile — above this, majority of transactions are fraud
+    if amt >= 900 or score >= THRESHOLD :
         return "fraud"
-    elif score >= THRESHOLD * 0.6:
+
+    if amt >= 600 or score >= THRESHOLD * 0.6:
         return "warn"
+
     return "legit"
 
 
@@ -272,7 +286,7 @@ def state_label(state):
 
 def score_color(score):
     if score >= THRESHOLD:      return "#ef4444"
-    elif score >= THRESHOLD * 0.6: return "#f59e0b"
+    elif score >= THRESHOLD * 0.5: return "#f59e0b"
     return "#10b981"
 
 
@@ -333,6 +347,9 @@ SCENARIOS = {
             {"cc": "CARD_004", "offset_min": 0,     "amt": 890.00,  "cat": "shopping_net", "label": "Day 0: Sudden spike"},
             {"cc": "CARD_004", "offset_min": 15,    "amt": 1200.00, "cat": "misc_net",     "label": "Day 0: Continued"},
             {"cc": "CARD_004", "offset_min": 30,    "amt": 1500.00, "cat": "shopping_net", "label": "Day 0: Account drain"},
+            {"cc": "CARD_004", "offset_min": 15, "amt": 1500.00, "cat": "shopping_net",
+             "label": "Day 0: Account drain"},
+
         ]
     },
     "night_fraud": {
@@ -351,34 +368,42 @@ SCENARIOS = {
 
 # ── Feature contribution chart ─────────────────────────────────────────────────
 def contribution_bar_chart(features, score):
-    """
-    Approximate feature contributions using known feature importances.
-    Uses only features actually in the model — amt_zscore excluded.
-    For real SHAP values, pass model to shap.TreeExplainer instead.
-    """
-    raw = {
-        'amt':          features['amt'] / 500 * 0.30,
-        'tx_count_24h': features['tx_count_24h'] / 5 * 0.35,
-        'amt_sum_24h':  features['amt_sum_24h'] / 2000 * 0.25,
-        'tx_count_1h':  features['tx_count_1h'] / 3 * 0.10,
-        'time_of_day':  0.05 if features['time_of_day'] < 6 else -0.02,
-    }
-    total = sum(abs(v) for v in raw.values())
-    contribs = {k: v / total * score for k, v in raw.items()} if total > 0 else raw
 
-    fig, ax = plt.subplots(figsize=(5, 2.8))
+
+    X = pd.DataFrame([features])
+    for col in MODEL_FEATURES:
+        if col not in X.columns:
+            X[col] = 0
+    X = X[MODEL_FEATURES]
+
+    shap_values = explainer.shap_values(X)  # shape: (1, n_features)
+    vals = shap_values[0]
+    cols = MODEL_FEATURES
+
+    # collapse OHE columns into one "category" contribution
+    cat_mask = [c.startswith("category_") for c in cols]
+    cat_contribution = sum(v for v, m in zip(vals, cat_mask) if m)
+
+    non_cat_vals = [v for v, m in zip(vals, cat_mask) if not m]
+    non_cat_names = [c for c, m in zip(cols, cat_mask) if not m]
+
+    final_vals = non_cat_vals + [cat_contribution]
+    final_names = non_cat_names + ["category"]
+
+    # sort by absolute value
+    paired = sorted(zip(final_vals, final_names), key=lambda x: abs(x[0]))
+    final_vals, final_names = zip(*paired)
+
+    fig, ax = plt.subplots(figsize=(5, 3.2))
     fig.patch.set_facecolor("#111827")
     ax.set_facecolor("#111827")
 
-    keys   = list(contribs.keys())
-    values = list(contribs.values())
-    colors = ["#ef4444" if v > 0 else "#10b981" for v in values]
-
-    ax.barh(keys, values, color=colors, height=0.5)
+    colors = ["#ef4444" if v > 0 else "#10b981" for v in final_vals]
+    ax.barh(final_names, final_vals, color=colors, height=0.5)
     ax.axvline(0, color="#334155", linewidth=0.8)
     ax.tick_params(colors="#94a3b8", labelsize=8)
     ax.spines[:].set_visible(False)
-    ax.set_xlabel("Contribution to fraud score", color="#64748b", fontsize=8)
+    ax.set_xlabel("SHAP value (impact on fraud score)", color="#64748b", fontsize=8)
     plt.tight_layout()
     return fig
 
@@ -478,7 +503,7 @@ with right:
                     tx["cc"], ts, tx["amt"], tx["cat"]
                 )
                 score = predict(features)
-                state = score_to_state(score)
+                state = score_to_state(score,tx["amt"])
 
                 st.session_state.tx_log.append({
                     "label":    tx["label"],
